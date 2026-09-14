@@ -29,6 +29,8 @@ models/*.gguf.part
 huggingface/
 *.bin
 *.safetensors
+*.onnx
+models/multilingual-MiniLMv2-L6-mnli-xnli/
 
 # IDE / OS
 .idea/

@@ -1,25 +1,72 @@
+import os
+from pathlib import Path
 from typing import Dict, List
 
-from fastapi import FastAPI
+import numpy as np
+from fastapi import FastAPI, HTTPException
+from huggingface_hub import snapshot_download
 from pydantic import BaseModel, Field
-from transformers import pipeline
+from transformers import AutoTokenizer
+import onnxruntime as ort
 
-MODEL_NAME = "MoritzLaurer/multilingual-MiniLMv2-L6-mnli-xnli"
 
-# Load sekali saat API start, bukan setiap request.
-classifier = pipeline(
-    "zero-shot-classification",
-    model=MODEL_NAME,
-    device=-1,  # CPU
+MODEL_ID = os.getenv(
+    "INTENT_MODEL_ID",
+    "MoritzLaurer/multilingual-MiniLMv2-L6-mnli-xnli",
 )
+MODEL_DIR = Path(
+    os.getenv(
+        "INTENT_MODEL_DIR",
+        str(Path("models") / "multilingual-MiniLMv2-L6-mnli-xnli"),
+    )
+)
+HYPOTHESIS_TEMPLATE = "Maksud pertanyaan pengguna adalah: {}"
+ENTAILMENT_INDEX = 0
+MAX_LENGTH = 512
+
+
+def ensure_minilm(model_id: str, dest: Path) -> Path:
+    onnx_path = dest / "onnx" / "model.onnx"
+    tokenizer_ok = (dest / "tokenizer.json").exists() or (
+        dest / "sentencepiece.bpe.model"
+    ).exists()
+    if onnx_path.exists() and tokenizer_ok:
+        return onnx_path
+
+    dest.mkdir(parents=True, exist_ok=True)
+    print(f"Model NLI tidak lengkap di {dest}. Mengunduh {model_id}...")
+    snapshot_download(
+        repo_id=model_id,
+        local_dir=str(dest),
+        allow_patterns=[
+            "onnx/**",
+            "config.json",
+            "tokenizer.json",
+            "tokenizer_config.json",
+            "special_tokens_map.json",
+            "sentencepiece.bpe.model",
+        ],
+    )
+    if not onnx_path.exists():
+        raise RuntimeError(f"File ONNX tidak ditemukan: {onnx_path}")
+    print(f"Model NLI tersimpan di {dest}")
+    return onnx_path
+
+
+onnx_model_path = ensure_minilm(MODEL_ID, MODEL_DIR)
+tokenizer = AutoTokenizer.from_pretrained(str(MODEL_DIR), use_fast=True)
+session = ort.InferenceSession(
+    str(onnx_model_path),
+    providers=["CPUExecutionProvider"],
+)
+ONNX_INPUT_NAMES = [item.name for item in session.get_inputs()]
 
 app = FastAPI(
     title="Finance Intent Classifier",
-    version="1.0.0",
-    description="Local zero-shot intent router untuk menentukan flow setelah user bertanya.",
+    version="2.0.0",
+    description="Local MiniLM NLI intent router untuk menentukan flow setelah user bertanya.",
 )
 
-# Intent sengaja dibuat sedikit dan berdasarkan flow aplikasi.
 INTENTS: Dict[str, str] = {
     "DIRECT_DATA": (
         "Pengguna hanya meminta data, angka, daftar, tabel, grafik, perbandingan, "
@@ -35,7 +82,6 @@ INTENTS: Dict[str, str] = {
     ),
 }
 
-# Untuk mapping hasil intent ke flow aplikasi.
 POLICY = {
     "DIRECT_DATA": {
         "need_ai_after_query": False,
@@ -51,11 +97,7 @@ POLICY = {
     },
 }
 
-# Threshold awal. Jangan anggap angka ini final;
-# nanti sebaiknya dikalibrasi menggunakan data pertanyaan nyata.
 MIN_SCORE = 0.50
-
-# Kalau dua label teratas terlalu dekat, anggap ambigu.
 MIN_MARGIN = 0.10
 
 
@@ -79,53 +121,55 @@ class ClassifyResponse(BaseModel):
     scores: List[ScoreItem]
 
 
-@app.get("/")
-def root():
-    return {
-        "service": "finance-intent-classifier",
-        "status": "ok",
-        "model": MODEL_NAME,
-        "intents": list(INTENTS.keys()),
-    }
+def softmax(values: np.ndarray) -> np.ndarray:
+    shifted = values - np.max(values)
+    exp_values = np.exp(shifted)
+    return exp_values / exp_values.sum()
 
 
-@app.get("/health")
-def health():
-    return {
-        "status": "healthy",
-        "model_loaded": True,
-    }
-
-
-@app.post("/classify", response_model=ClassifyResponse)
-def classify(request: ClassifyRequest):
-    labels = list(INTENTS.values())
-
-    result = classifier(
-        request.question,
-        candidate_labels=labels,
-        hypothesis_template="Maksud pertanyaan pengguna adalah: {}",
-        multi_label=False,
+def nli_logits(premise: str, hypothesis: str) -> np.ndarray:
+    encoded = tokenizer(
+        premise,
+        hypothesis,
+        truncation=True,
+        max_length=MAX_LENGTH,
+        return_tensors="np",
     )
+    inputs = {}
+    for name in ONNX_INPUT_NAMES:
+        if name in encoded:
+            inputs[name] = encoded[name]
+        elif name == "token_type_ids":
+            inputs[name] = np.zeros_like(encoded["input_ids"])
+        else:
+            raise RuntimeError(f"Input ONNX tidak dikenali: {name}")
+    outputs = session.run(None, inputs)[0]
+    return outputs[0]
 
-    # Mapping label deskriptif kembali ke kode intent.
-    label_to_intent = {description: intent for intent, description in INTENTS.items()}
 
-    ranked_scores = []
-    for label, score in zip(result["labels"], result["scores"]):
-        ranked_scores.append(
-            {
-                "intent": label_to_intent[label],
-                "score": float(score),
-            }
-        )
+def classify_question(question: str) -> dict:
+    labels = list(INTENTS.keys())
+    entailment_scores = []
+
+    for intent in labels:
+        hypothesis = HYPOTHESIS_TEMPLATE.format(INTENTS[intent])
+        logits = nli_logits(question, hypothesis)
+        entailment_scores.append(float(logits[ENTAILMENT_INDEX]))
+
+    probs = softmax(np.array(entailment_scores, dtype=np.float64))
+    ranked_scores = sorted(
+        [
+            {"intent": intent, "score": float(score)}
+            for intent, score in zip(labels, probs)
+        ],
+        key=lambda item: item["score"],
+        reverse=True,
+    )
 
     top = ranked_scores[0]
     second = ranked_scores[1] if len(ranked_scores) > 1 else {"score": 0.0}
-
     confidence = top["score"]
     margin = confidence - second["score"]
-
     is_ambiguous = confidence < MIN_SCORE or margin < MIN_MARGIN
 
     if is_ambiguous:
@@ -139,7 +183,7 @@ def classify(request: ClassifyRequest):
         recommended_render = policy["recommended_render"]
 
     return {
-        "question": request.question,
+        "question": question,
         "intent": intent,
         "confidence": round(confidence, 4),
         "margin": round(margin, 4),
@@ -154,3 +198,34 @@ def classify(request: ClassifyRequest):
             for item in ranked_scores
         ],
     }
+
+
+@app.get("/")
+def root():
+    return {
+        "service": "finance-intent-classifier",
+        "status": "ok",
+        "model": MODEL_ID,
+        "intents": list(INTENTS.keys()),
+    }
+
+
+@app.get("/health")
+def health():
+    return {
+        "status": "healthy",
+        "model_loaded": True,
+        "model": MODEL_ID,
+        "model_dir": str(MODEL_DIR),
+    }
+
+
+@app.post("/classify", response_model=ClassifyResponse)
+def classify(request: ClassifyRequest):
+    try:
+        return classify_question(request.question)
+    except Exception as exc:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Klasifikasi gagal: {exc}",
+        ) from exc
