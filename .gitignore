@@ -1,0 +1,43 @@
+# Virtualenv
+.venv/
+venv/
+env/
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+.eggs/
+dist/
+build/
+
+# Local env / secrets
+.env
+.env.*
+
+# Model weights (unduh otomatis saat API start)
+models/*.gguf
+models/*.gguf.part
+*.gguf
+*.gguf.part
+
+# Hugging Face / transformers cache
+.cache/
+huggingface/
+*.bin
+*.safetensors
+
+# IDE / OS
+.idea/
+.vscode/
+*.swp
+.DS_Store
+Thumbs.db
+
+# Test / coverage
+.pytest_cache/
+.coverage
+htmlcov/

@@ -1,0 +1,8 @@
+fastapi==0.141.1
+uvicorn==0.52.4
+pydantic==2.13.5
+llama-cpp-python==0.3.35
+requests==2.34.2
+transformers==5.17.0
+torch==2.14.0
+huggingface_hub==1.31.0
