@@ -17,13 +17,12 @@ from llama_cpp import Llama
 
 MODEL_PATH = os.getenv(
     "QWEN_MODEL_PATH",
-    str(Path("models") / "qwen3-1.7b-q4_k_m.gguf"),
+    str(Path("models") / "qwen2.5-1.5b-instruct-q4_k_m.gguf"),
 )
 MODEL_URL = os.getenv(
     "QWEN_MODEL_URL",
-    "https://huggingface.co/unsloth/Qwen3-1.7B-GGUF/resolve/"
-    "cc27747d7419139e44ba97777c2f2fd5dca92ee1/"
-    "Qwen3-1.7B-Q4_K_M.gguf?download=true",
+    "https://huggingface.co/Qwen/Qwen2.5-1.5B-Instruct-GGUF/resolve/"
+    "main/qwen2.5-1.5b-instruct-q4_k_m.gguf?download=true",
 )
 
 N_CTX = int(os.getenv("QWEN_N_CTX", "2048"))
@@ -31,6 +30,9 @@ N_THREADS = int(
     os.getenv("QWEN_N_THREADS", str(max(1, (os.cpu_count() or 4) - 1)))
 )
 N_BATCH = int(os.getenv("QWEN_N_BATCH", "256"))
+# -1 = offload semua layer ke GPU jika llama-cpp punya CUDA/Vulkan.
+# Build CPU-only akan mengabaikan nilai ini.
+N_GPU_LAYERS = int(os.getenv("QWEN_N_GPU_LAYERS", "-1"))
 
 
 def ensure_model(path: str, url: str) -> None:
@@ -86,13 +88,15 @@ llm = Llama(
     n_ctx=N_CTX,
     n_threads=N_THREADS,
     n_batch=N_BATCH,
+    n_gpu_layers=N_GPU_LAYERS,
+    chat_format="chatml",
     verbose=False,
 )
 
 
 app = FastAPI(
-    title="Local Finance Narrator - Qwen3",
-    version="1.1.0",
+    title="Local Finance Narrator - Qwen2.5",
+    version="1.2.0",
 )
 
 
@@ -249,7 +253,7 @@ def get_relevant_banking_context(question: str, data: Any) -> Dict[str, Any]:
 class NarrateRequest(BaseModel):
     question: str = Field(..., min_length=1, max_length=2000)
     data: Any
-    max_tokens: int = Field(default=220, ge=32, le=600)
+    max_tokens: int = Field(default=120, ge=32, le=400)
     temperature: float = Field(default=0.10, ge=0.0, le=1.0)
 
 
@@ -280,7 +284,6 @@ ATURAN WAJIB:
 8. Jika pertanyaan hanya meminta angka, jawab angka utama terlebih dahulu.
 9. Gunakan Bahasa Indonesia yang singkat, jelas, dan profesional.
 10. Maksimal 2 paragraf pendek.
-11. Jangan tampilkan proses berpikir.
 """.strip()
 
 
@@ -347,7 +350,6 @@ DATA:
 {data_text}
 
 Buat jawaban untuk user berdasarkan context dan data di atas saja.
-/no_think
 """.strip()
 
     started = time.perf_counter()
@@ -368,6 +370,7 @@ Buat jawaban untuk user berdasarkan context dan data di atas saja.
             temperature=request.temperature,
             top_p=0.85,
             repeat_penalty=1.05,
+            stop=["<|im_end|>", "<|endoftext|>"],
         )
     except Exception as exc:
         raise HTTPException(
